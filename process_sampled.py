@@ -82,6 +82,23 @@ def get_conversation_text_for_dedup(record):
     return " ".join(text_parts)
 
 
+def get_user_input_for_dedup(record):
+    """
+    Extract only user input text for deduplication.
+    Concatenates all user messages in the conversation.
+    """
+    conversation = record.get('conversation', [])
+
+    user_parts = []
+    for msg in conversation:
+        if isinstance(msg, dict) and msg.get('role') == 'user':
+            content = msg.get('content', '').strip()
+            if content:
+                user_parts.append(content)
+
+    return " ".join(user_parts)
+
+
 # =============================================================================
 # Quality Filtering Functions (Non-destructive)
 # =============================================================================
@@ -229,7 +246,10 @@ def apply_deduplication(
     threshold: float = 0.8
 ) -> List[Dict[str, Any]]:
     """
-    Apply MinHash LSH deduplication to records that passed quality filters (non-destructive).
+    Apply two-phase MinHash LSH deduplication (non-destructive):
+    1. Deduplicate based on user input (since inputs are usually small)
+    2. Deduplicate based on full conversation trace
+
     Updates filter_passed and filter_reason for duplicates.
 
     Args:
@@ -239,32 +259,63 @@ def apply_deduplication(
     Returns:
         Same list with updated fields (no records removed)
     """
-    print(f"Phase 2: Applying MinHash deduplication (threshold={threshold})...")
+    print(f"Phase 2: Applying two-phase MinHash deduplication (threshold={threshold})...")
 
-    duplicates = 0
-    lsh = MinHashLSH(threshold=threshold, num_perm=128)
+    # Phase 1: Deduplicate based on user input
+    print("  Phase 2a: Deduplicating by user input...")
+    user_input_duplicates = 0
+    lsh_user = MinHashLSH(threshold=threshold, num_perm=128)
 
-    for i, record in enumerate(tqdm(data, desc="MinHash dedup")):
+    for i, record in enumerate(tqdm(data, desc="User input dedup")):
         if not record['filter_passed']:
             continue
 
-        text = get_conversation_text_for_dedup(record)
-        if len(text.strip()) < 10:
+        user_text = get_user_input_for_dedup(record)
+        if len(user_text.strip()) < 5:  # Skip very short user inputs
             continue
 
-        minhash = create_minhash(text, num_perm=128)
-        key = f"record_{i}"
-        similar = lsh.query(minhash)
+        minhash = create_minhash(user_text, num_perm=128)
+        key = f"user_{i}"
+        similar = lsh_user.query(minhash)
 
         if similar:
             record['filter_passed'] = False
-            record['filter_reason'] = 'duplicate_minhash'
-            duplicates += 1
+            record['filter_reason'] = 'duplicate_user_input'
+            user_input_duplicates += 1
         else:
-            lsh.insert(key, minhash)
+            lsh_user.insert(key, minhash)
 
+    print(f"    User input duplicates: {user_input_duplicates:,}")
+
+    # Phase 2: Deduplicate based on full conversation (for records that passed Phase 1)
+    print("  Phase 2b: Deduplicating by full conversation...")
+    conversation_duplicates = 0
+    lsh_conv = MinHashLSH(threshold=threshold, num_perm=128)
+
+    for i, record in enumerate(tqdm(data, desc="Conversation dedup")):
+        if not record['filter_passed']:
+            continue
+
+        conv_text = get_conversation_text_for_dedup(record)
+        if len(conv_text.strip()) < 10:
+            continue
+
+        minhash = create_minhash(conv_text, num_perm=128)
+        key = f"conv_{i}"
+        similar = lsh_conv.query(minhash)
+
+        if similar:
+            record['filter_passed'] = False
+            record['filter_reason'] = 'duplicate_conversation'
+            conversation_duplicates += 1
+        else:
+            lsh_conv.insert(key, minhash)
+
+    print(f"    Conversation duplicates: {conversation_duplicates:,}")
+
+    total_duplicates = user_input_duplicates + conversation_duplicates
     passed = sum(1 for r in data if r['filter_passed'])
-    print(f"  Duplicates found: {duplicates:,}")
+    print(f"  Total duplicates found: {total_duplicates:,} ({user_input_duplicates:,} user input, {conversation_duplicates:,} conversation)")
     print(f"  Records passing all filters: {passed:,}")
 
     return data
