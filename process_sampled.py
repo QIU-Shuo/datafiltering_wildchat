@@ -18,7 +18,6 @@ Output Schema (New Columns):
 
 import json
 import argparse
-import hashlib
 import re
 import warnings
 from pathlib import Path
@@ -207,34 +206,6 @@ def apply_quality_filters(data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 # Deduplication Functions (Non-destructive)
 # =============================================================================
 
-def get_conversation_fingerprint(record):
-    """Generate MD5 fingerprint for exact deduplication."""
-    conversation = record.get('conversation', [])
-
-    messages = []
-    for msg in conversation:
-        if isinstance(msg, dict):
-            role = msg.get('role', '')
-            content = msg.get('content', '')
-            messages.append({'role': role, 'content': content})
-
-    fingerprint_parts = []
-    for i, msg in enumerate(messages):
-        role = msg['role']
-        content = msg['content']
-
-        if role == 'user':
-            fingerprint_parts.append(f"USER:{content}")
-        elif role == 'assistant':
-            is_last_message = (i == len(messages) - 1)
-            if not is_last_message:
-                fingerprint_parts.append(f"ASSISTANT:{content}")
-
-    fingerprint_parts.append(f"LENGTH:{len(messages)}")
-    fingerprint_string = "|||".join(fingerprint_parts)
-    return hashlib.md5(fingerprint_string.encode('utf-8')).hexdigest()
-
-
 def create_minhash(text, num_perm=128):
     """Create MinHash signature for text."""
     m = MinHash(num_perm=num_perm)
@@ -253,133 +224,44 @@ def create_minhash(text, num_perm=128):
     return m
 
 
-def simhash(text, hash_bits=64):
-    """Create SimHash signature for text."""
-    words = text.lower().split()
-
-    ngrams = []
-    for word in words:
-        if len(word) >= 3:
-            for i in range(len(word) - 2):
-                ngrams.append(word[i:i+3])
-
-    tokens = words + ngrams
-    vector = [0] * hash_bits
-
-    for token in tokens:
-        h = int(hashlib.md5(token.encode('utf-8')).hexdigest(), 16)
-        for i in range(hash_bits):
-            if h & (1 << i):
-                vector[i] += 1
-            else:
-                vector[i] -= 1
-
-    fingerprint = 0
-    for i in range(hash_bits):
-        if vector[i] > 0:
-            fingerprint |= (1 << i)
-
-    return fingerprint
-
-
-def hamming_distance(hash1, hash2):
-    """Calculate Hamming distance between two hashes."""
-    x = hash1 ^ hash2
-    distance = 0
-    while x:
-        distance += 1
-        x &= x - 1
-    return distance
-
-
 def apply_deduplication(
     data: List[Dict[str, Any]],
-    method: str = 'minhash',
     threshold: float = 0.8
 ) -> List[Dict[str, Any]]:
     """
-    Apply deduplication to records that passed quality filters (non-destructive).
+    Apply MinHash LSH deduplication to records that passed quality filters (non-destructive).
     Updates filter_passed and filter_reason for duplicates.
 
     Args:
         data: List of records with filter_passed field
-        method: 'exact', 'minhash', or 'simhash'
-        threshold: Similarity threshold (0.0-1.0 for minhash, int for simhash)
+        threshold: Jaccard similarity threshold (0.0-1.0, default 0.8)
 
     Returns:
         Same list with updated fields (no records removed)
     """
-    print(f"Phase 2: Applying {method} deduplication...")
+    print(f"Phase 2: Applying MinHash deduplication (threshold={threshold})...")
 
     duplicates = 0
+    lsh = MinHashLSH(threshold=threshold, num_perm=128)
 
-    if method == 'exact':
-        seen_fingerprints = set()
+    for i, record in enumerate(tqdm(data, desc="MinHash dedup")):
+        if not record['filter_passed']:
+            continue
 
-        for record in tqdm(data, desc="Exact dedup"):
-            if not record['filter_passed']:
-                continue
+        text = get_conversation_text_for_dedup(record)
+        if len(text.strip()) < 10:
+            continue
 
-            fingerprint = get_conversation_fingerprint(record)
-            if fingerprint in seen_fingerprints:
-                record['filter_passed'] = False
-                record['filter_reason'] = 'duplicate_exact'
-                duplicates += 1
-            else:
-                seen_fingerprints.add(fingerprint)
+        minhash = create_minhash(text, num_perm=128)
+        key = f"record_{i}"
+        similar = lsh.query(minhash)
 
-    elif method == 'minhash':
-        lsh = MinHashLSH(threshold=threshold, num_perm=128)
-
-        for i, record in enumerate(tqdm(data, desc="MinHash dedup")):
-            if not record['filter_passed']:
-                continue
-
-            text = get_conversation_text_for_dedup(record)
-            if len(text.strip()) < 10:
-                continue
-
-            minhash = create_minhash(text, num_perm=128)
-            key = f"record_{i}"
-            similar = lsh.query(minhash)
-
-            if similar:
-                record['filter_passed'] = False
-                record['filter_reason'] = 'duplicate_minhash'
-                duplicates += 1
-            else:
-                lsh.insert(key, minhash)
-
-    elif method == 'simhash':
-        simhash_threshold = int(threshold) if threshold > 1 else 3
-        seen_hashes = []
-
-        for record in tqdm(data, desc="SimHash dedup"):
-            if not record['filter_passed']:
-                continue
-
-            text = get_conversation_text_for_dedup(record)
-            if len(text.strip()) < 10:
-                continue
-
-            hash_value = simhash(text, hash_bits=64)
-            is_duplicate = False
-
-            for existing_hash in seen_hashes:
-                distance = hamming_distance(hash_value, existing_hash)
-                if distance <= simhash_threshold:
-                    is_duplicate = True
-                    break
-
-            if is_duplicate:
-                record['filter_passed'] = False
-                record['filter_reason'] = 'duplicate_simhash'
-                duplicates += 1
-            else:
-                seen_hashes.append(hash_value)
-
-    else:
-        raise ValueError(f"Unknown dedup method: {method}")
+        if similar:
+            record['filter_passed'] = False
+            record['filter_reason'] = 'duplicate_minhash'
+            duplicates += 1
+        else:
+            lsh.insert(key, minhash)
 
     passed = sum(1 for r in data if r['filter_passed'])
     print(f"  Duplicates found: {duplicates:,}")
@@ -392,84 +274,37 @@ def apply_deduplication(
 # Clustering Functions
 # =============================================================================
 
-def compute_auto_cluster_params(
-    n_records: int,
-    min_cluster_size: Optional[int] = None,
-    min_samples: Optional[int] = None
-) -> Tuple[int, int]:
-    """
-    Automatically determine HDBSCAN parameters based on dataset size.
-
-    Heuristics:
-    - min_cluster_size: log(n) + 2, clamped to [3, 20]
-    - min_samples: log(n) + 1, clamped to [2, 10]
-
-    Args:
-        n_records: Number of records to cluster
-        min_cluster_size: Override value (None for auto)
-        min_samples: Override value (None for auto)
-
-    Returns:
-        Tuple of (min_cluster_size, min_samples)
-    """
-    log_n = np.log10(max(1, n_records))  # Avoid log(0)
-
-    if min_cluster_size is None:
-        # Use log(n) + 2 as default, clamped to [3, 20]
-        auto_min_cluster_size = int(log_n + 2)
-        auto_min_cluster_size = max(3, min(20, auto_min_cluster_size))
-    else:
-        auto_min_cluster_size = min_cluster_size
-
-    if min_samples is None:
-        # Use log(n) + 1 as default, clamped to [2, 10]
-        auto_min_samples = int(log_n + 1)
-        auto_min_samples = max(2, min(10, auto_min_samples))
-    else:
-        auto_min_samples = min_samples
-
-    return auto_min_cluster_size, auto_min_samples
-
-
 def apply_clustering(
     data: List[Dict[str, Any]],
-    min_cluster_size: Optional[int] = None,
-    min_samples: Optional[int] = None,
+    min_cluster_size: int = 2,
+    min_samples: int = 2,
     metric: str = 'euclidean',
     cluster_selection_method: str = 'eom'
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
-    Apply HDBSCAN clustering to ALL records using their embeddings.
+    Apply HDBSCAN clustering to filtered records only using their embeddings.
 
     Args:
         data: List of records with embedding field
-        min_cluster_size: Minimum cluster size (None for auto)
-        min_samples: Minimum samples (None for auto)
+        min_cluster_size: Minimum cluster size (default: 2)
+        min_samples: Minimum samples (default: 2)
         metric: Distance metric for HDBSCAN
         cluster_selection_method: 'eom' or 'leaf'
 
     Returns:
         Tuple of (data with cluster fields, clustering stats)
     """
-    print("Phase 3: Clustering ALL records...")
+    print("Phase 3: Clustering filtered records...")
+    print(f"  min_cluster_size: {min_cluster_size}")
+    print(f"  min_samples: {min_samples}")
 
-    # Track if parameters were auto-computed
-    auto_cluster_size = min_cluster_size is None
-    auto_samples = min_samples is None
+    # Extract embeddings ONLY from filtered records
+    filtered_indices = [i for i, r in enumerate(data) if r.get('filter_passed', False)]
+    filtered_embeddings = np.array([data[i]['embedding'] for i in filtered_indices])
 
-    # Auto-determine parameters if not specified
-    min_cluster_size, min_samples = compute_auto_cluster_params(
-        n_records=len(data),
-        min_cluster_size=min_cluster_size,
-        min_samples=min_samples
-    )
-    print(f"  min_cluster_size: {min_cluster_size}{' (auto)' if auto_cluster_size else ''}")
-    print(f"  min_samples: {min_samples}{' (auto)' if auto_samples else ''}")
+    print(f"  Clustering {len(filtered_indices):,} filtered records (excluding {len(data) - len(filtered_indices):,} filtered-out)")
 
-    # Extract embeddings from records
-    embeddings = np.array([record['embedding'] for record in data])
-
-    # Run HDBSCAN
+    # Run HDBSCAN on filtered records only
     clusterer = hdbscan.HDBSCAN(
         min_cluster_size=min_cluster_size,
         min_samples=min_samples,
@@ -478,13 +313,19 @@ def apply_clustering(
         core_dist_n_jobs=-1
     )
 
-    cluster_labels = clusterer.fit_predict(embeddings)
+    cluster_labels = clusterer.fit_predict(filtered_embeddings)
     probabilities = clusterer.probabilities_
 
-    # Add cluster info to records
-    for record, label, prob in zip(data, cluster_labels, probabilities):
-        record['cluster_id'] = int(label)
-        record['cluster_probability'] = float(prob)
+    # Initialize ALL records with noise cluster
+    for record in data:
+        record['cluster_id'] = -1
+        record['cluster_probability'] = 0.0
+
+    # Assign cluster info ONLY to filtered records
+    for idx, (label, prob) in enumerate(zip(cluster_labels, probabilities)):
+        original_idx = filtered_indices[idx]
+        data[original_idx]['cluster_id'] = int(label)
+        data[original_idx]['cluster_probability'] = float(prob)
 
     # Compute statistics
     unique_labels = np.unique(cluster_labels)
@@ -527,23 +368,27 @@ def compute_combined_score(record: Dict[str, Any]) -> float:
 
 def apply_sampling(
     data: List[Dict[str, Any]],
-    total_samples: Optional[int] = None
+    total_samples: int
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
-    Apply sampling strategy after clustering:
-    1. Pick 1 record with highest score from each cluster (excluding noise)
-    2. Fill remaining quota from noise points (cluster_id == -1)
+    Apply new sampling strategy after clustering:
+    1. Pick 10% from noise points (best scored)
+    2. Rank clusters by size (large to small), pick best from each until target reached
+    3. If not enough after one pass, sample more from remaining noise
+    4. If still not enough, repeat cluster sampling (2nd best, 3rd best, etc.)
 
     Only considers records that passed filtering (filter_passed=True).
+    Filtered records (filter_passed=False) are always excluded.
 
     Args:
         data: List of records with cluster_id and filter_passed fields
-        total_samples: Total number of samples to select (None = 1 per cluster + all noise)
+        total_samples: Total number of samples to select (required)
 
     Returns:
         Tuple of (data with is_sampled field, sampling stats)
     """
     print("Phase 4: Sampling records...")
+    print(f"  Target dataset size: {total_samples:,}")
 
     # Initialize is_sampled to False for all records
     for record in data:
@@ -554,6 +399,7 @@ def apply_sampling(
     noise_records = []
 
     for i, record in enumerate(data):
+        # Always exclude filtered-out records
         if not record.get('filter_passed', False):
             continue
 
@@ -563,53 +409,115 @@ def apply_sampling(
         else:
             clusters[cluster_id].append(i)
 
-    # Step 1: Pick 1 highest-scoring record from each cluster
-    sampled_indices = []
-    for cluster_id, indices in clusters.items():
-        # Find record with highest combined score
-        best_idx = max(indices, key=lambda i: compute_combined_score(data[i]))
-        sampled_indices.append(best_idx)
-        data[best_idx]['is_sampled'] = True
+    print(f"  Available: {len(clusters)} clusters, {len(noise_records):,} noise points")
 
-    num_from_clusters = len(sampled_indices)
-    print(f"  Selected {num_from_clusters} records from {len(clusters)} clusters (1 per cluster)")
+    # Sort noise by score (descending)
+    noise_records_sorted = sorted(
+        noise_records,
+        key=lambda i: compute_combined_score(data[i]),
+        reverse=True
+    )
 
-    # Step 2: Fill remaining quota from noise points
-    if total_samples is not None:
-        remaining = total_samples - num_from_clusters
-        if remaining > 0:
-            # Sort noise records by score (highest first)
-            noise_records_sorted = sorted(
-                noise_records,
-                key=lambda i: compute_combined_score(data[i]),
-                reverse=True
-            )
-            # Take top N from noise
-            noise_to_sample = noise_records_sorted[:remaining]
-            for idx in noise_to_sample:
-                data[idx]['is_sampled'] = True
-                sampled_indices.append(idx)
-            print(f"  Selected {len(noise_to_sample)} additional records from noise points")
-        elif remaining < 0:
-            print(f"  Warning: total_samples ({total_samples}) < clusters ({num_from_clusters}), no noise sampling")
-    else:
-        # If no total_samples specified, include all noise points
-        for idx in noise_records:
-            data[idx]['is_sampled'] = True
-            sampled_indices.append(idx)
-        print(f"  Selected all {len(noise_records)} noise points")
+    # Sort clusters by size (largest to smallest)
+    clusters_sorted = sorted(
+        clusters.items(),
+        key=lambda x: len(x[1]),
+        reverse=True
+    )
 
-    total_sampled = sum(1 for r in data if r['is_sampled'])
+    # Pre-sort records within each cluster by score (descending)
+    cluster_records_sorted = {}
+    for cluster_id, indices in clusters_sorted:
+        cluster_records_sorted[cluster_id] = sorted(
+            indices,
+            key=lambda i: compute_combined_score(data[i]),
+            reverse=True
+        )
+
+    sampled_indices = set()
+    noise_sampled = 0
+    cluster_sampled = 0
+
+    # Step 1: Pick 10% from noise (best scored)
+    noise_quota = int(0.1 * total_samples)
+    noise_quota = min(noise_quota, len(noise_records_sorted))  # Can't sample more than available
+
+    for idx in noise_records_sorted[:noise_quota]:
+        data[idx]['is_sampled'] = True
+        sampled_indices.add(idx)
+        noise_sampled += 1
+
+    print(f"  Step 1: Selected {noise_sampled:,} from noise (10% quota)")
+
+    # Remaining noise for later use
+    remaining_noise = noise_records_sorted[noise_quota:]
+    remaining_noise_idx = 0  # Track position in remaining noise
+
+    # Step 2-4: Pick from clusters in rounds, with noise fill after first round
+    round_num = 0
+    max_cluster_size = max(len(records) for records in cluster_records_sorted.values()) if cluster_records_sorted else 0
+
+    while len(sampled_indices) < total_samples and round_num < max_cluster_size:
+        made_progress = False
+
+        # Go through clusters from largest to smallest
+        for cluster_id, _ in clusters_sorted:
+            if len(sampled_indices) >= total_samples:
+                break
+
+            # Try to pick the round_num-th best record from this cluster
+            cluster_records = cluster_records_sorted[cluster_id]
+            if round_num < len(cluster_records):
+                idx = cluster_records[round_num]
+                if idx not in sampled_indices:
+                    data[idx]['is_sampled'] = True
+                    sampled_indices.add(idx)
+                    cluster_sampled += 1
+                    made_progress = True
+
+        # After first complete pass through all clusters
+        if round_num == 0 and len(sampled_indices) < total_samples:
+            # Step 3: Sample more from remaining noise
+            needed = min(total_samples - len(sampled_indices), len(remaining_noise) - remaining_noise_idx)
+            noise_to_add = remaining_noise[remaining_noise_idx:remaining_noise_idx + needed]
+
+            for idx in noise_to_add:
+                if idx not in sampled_indices:
+                    data[idx]['is_sampled'] = True
+                    sampled_indices.add(idx)
+                    noise_sampled += 1
+
+            remaining_noise_idx += needed
+            print(f"  Step 2: Selected {needed:,} additional from remaining noise")
+
+        # Check if we reached target or can't make progress
+        if len(sampled_indices) >= total_samples:
+            break
+
+        if not made_progress:
+            break
+
+        round_num += 1
+
+    print(f"  Step 3: Selected {cluster_sampled:,} from clusters ({round_num + 1} rounds)")
+
+    # Final summary
+    total_sampled = len(sampled_indices)
+
+    if total_sampled < total_samples:
+        print(f"  Warning: Could not reach target size {total_samples:,}, sampled {total_sampled:,} records")
 
     stats = {
         'total_sampled': total_sampled,
-        'from_clusters': num_from_clusters,
-        'from_noise': total_sampled - num_from_clusters,
+        'from_clusters': cluster_sampled,
+        'from_noise': noise_sampled,
         'num_clusters': len(clusters),
-        'total_noise_available': len(noise_records)
+        'total_noise_available': len(noise_records_sorted),
+        'sampling_rounds': round_num + 1,
+        'target_size': total_samples
     }
 
-    print(f"  Total sampled: {total_sampled}")
+    print(f"  Total sampled: {total_sampled:,} ({cluster_sampled:,} from clusters, {noise_sampled:,} from noise)")
 
     return data, stats
 
@@ -704,13 +612,11 @@ def save_statistics(
 def process_sampled(
     input_file: str,
     output_file: str,
+    total_samples: int,
     # Clustering options
-    min_cluster_size: Optional[int] = None,
-    min_samples: Optional[int] = None,
-    # Sampling options
-    total_samples: Optional[int] = None,
+    min_cluster_size: int = 2,
+    min_samples: int = 2,
     # Filtering options
-    dedup_method: str = "minhash",
     dedup_threshold: float = 0.8,
     # Other options
     seed: int = 42
@@ -721,9 +627,13 @@ def process_sampled(
     Phases:
     1. Load data (with embeddings and scores from sample_data.py)
     2. Quality filtering (adds filter_passed, filter_reason)
-    3. Deduplication (updates filter_passed, filter_reason for duplicates)
+    3. MinHash deduplication (updates filter_passed, filter_reason for duplicates)
     4. HDBSCAN clustering (adds cluster_id, cluster_probability)
-    5. Sampling (adds is_sampled: 1 per cluster + noise to fill quota)
+    5. Sampling with new strategy:
+       - Pick 10% from noise (best scored)
+       - Pick from clusters by size (largest first), until target reached
+       - If not enough, sample more from remaining noise
+       - If still not enough, repeat cluster sampling (2nd best, 3rd best, etc.)
     6. Save complete dataset
     """
     np.random.seed(seed)
@@ -732,9 +642,8 @@ def process_sampled(
     print("PROCESS PRE-SAMPLED DATA PIPELINE")
     print("="*60)
     print(f"Input: {input_file}")
-    print(f"Dedup method: {dedup_method}")
-    if total_samples:
-        print(f"Total samples target: {total_samples}")
+    print(f"Total samples target: {total_samples:,}")
+    print(f"Dedup threshold: {dedup_threshold}")
     print("="*60)
 
     # Phase 1: Load data
@@ -744,8 +653,8 @@ def process_sampled(
     # Phase 2: Quality filtering
     data = apply_quality_filters(data)
 
-    # Phase 3: Deduplication
-    data = apply_deduplication(data, dedup_method, dedup_threshold)
+    # Phase 3: MinHash Deduplication
+    data = apply_deduplication(data, dedup_threshold)
 
     # Phase 4: Clustering (using existing embeddings)
     data, cluster_stats = apply_clustering(
@@ -779,19 +688,26 @@ def process_sampled(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description='Process pre-sampled WildChat data: filter, deduplicate, and cluster',
+        description='Process pre-sampled WildChat data: filter, deduplicate, cluster, and sample',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Basic usage
-  python process_sampled.py -i 2000.parquet -o 2000_processed.parquet
+  # Basic usage with target dataset size
+  python process_sampled.py -i 2000.parquet -o output.parquet --total-samples 500
 
   # Custom clustering parameters
-  python process_sampled.py -i 2000.parquet -o output.parquet \\
+  python process_sampled.py -i 2000.parquet -o output.parquet --total-samples 500 \\
       --min-cluster-size 10 --min-samples 5
 
-  # Use exact deduplication instead of minhash
-  python process_sampled.py -i 2000.parquet -o output.parquet --dedup-method exact
+  # Custom deduplication threshold
+  python process_sampled.py -i 2000.parquet -o output.parquet --total-samples 500 \\
+      --dedup-threshold 0.85
+
+Sampling Strategy:
+  1. Pick 10% of target from noise (best scored)
+  2. Rank clusters by size, pick best from each (largest first) until target reached
+  3. If not enough, sample more from remaining noise
+  4. If still not enough, repeat cluster sampling (2nd best, 3rd best, etc.)
         """
     )
 
@@ -800,22 +716,18 @@ Examples:
                         help='Input parquet file (from sample_data.py)')
     parser.add_argument('-o', '--output', required=True,
                         help='Output parquet file')
+    parser.add_argument('--total-samples', type=int, required=True,
+                        help='Target dataset size (number of samples to select)')
 
     # Clustering arguments
-    parser.add_argument('--min-cluster-size', type=int, default=None,
-                        help='HDBSCAN min cluster size (default: auto, log(n)+2 clamped to [3,20])')
-    parser.add_argument('--min-samples', type=int, default=None,
-                        help='HDBSCAN min samples (default: auto, log(n)+1 clamped to [2,10])')
-
-    # Sampling arguments
-    parser.add_argument('--total-samples', type=int, default=None,
-                        help='Total samples to select (default: 1 per cluster + all noise)')
+    parser.add_argument('--min-cluster-size', type=int, default=2,
+                        help='HDBSCAN min cluster size (default: 2)')
+    parser.add_argument('--min-samples', type=int, default=2,
+                        help='HDBSCAN min samples (default: 2)')
 
     # Filtering arguments
-    parser.add_argument('--dedup-method', choices=['exact', 'minhash', 'simhash'],
-                        default='minhash', help='Deduplication method (default: minhash)')
     parser.add_argument('--dedup-threshold', type=float, default=0.8,
-                        help='Deduplication threshold (default: 0.8)')
+                        help='MinHash deduplication threshold (Jaccard similarity 0.0-1.0, default: 0.8)')
 
     # Other arguments
     parser.add_argument('--seed', type=int, default=42,
@@ -826,10 +738,9 @@ Examples:
     process_sampled(
         input_file=args.input,
         output_file=args.output,
+        total_samples=args.total_samples,
         min_cluster_size=args.min_cluster_size,
         min_samples=args.min_samples,
-        total_samples=args.total_samples,
-        dedup_method=args.dedup_method,
         dedup_threshold=args.dedup_threshold,
         seed=args.seed
     )
