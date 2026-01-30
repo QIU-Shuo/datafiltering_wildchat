@@ -20,7 +20,6 @@ Output Schema (New Columns):
 
 import json
 import argparse
-import hashlib
 import os
 import datetime
 import asyncio
@@ -269,34 +268,6 @@ def apply_quality_filters(data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 # Deduplication Functions (Non-destructive)
 # =============================================================================
 
-def get_conversation_fingerprint(record):
-    """Generate MD5 fingerprint for exact deduplication."""
-    conversation = record.get('conversation', [])
-
-    messages = []
-    for msg in conversation:
-        if isinstance(msg, dict):
-            role = msg.get('role', '')
-            content = msg.get('content', '')
-            messages.append({'role': role, 'content': content})
-
-    fingerprint_parts = []
-    for i, msg in enumerate(messages):
-        role = msg['role']
-        content = msg['content']
-
-        if role == 'user':
-            fingerprint_parts.append(f"USER:{content}")
-        elif role == 'assistant':
-            is_last_message = (i == len(messages) - 1)
-            if not is_last_message:
-                fingerprint_parts.append(f"ASSISTANT:{content}")
-
-    fingerprint_parts.append(f"LENGTH:{len(messages)}")
-    fingerprint_string = "|||".join(fingerprint_parts)
-    return hashlib.md5(fingerprint_string.encode('utf-8')).hexdigest()
-
-
 def create_minhash(text, num_perm=128):
     """Create MinHash signature for text."""
     m = MinHash(num_perm=num_perm)
@@ -315,133 +286,44 @@ def create_minhash(text, num_perm=128):
     return m
 
 
-def simhash(text, hash_bits=64):
-    """Create SimHash signature for text."""
-    words = text.lower().split()
-
-    ngrams = []
-    for word in words:
-        if len(word) >= 3:
-            for i in range(len(word) - 2):
-                ngrams.append(word[i:i+3])
-
-    tokens = words + ngrams
-    vector = [0] * hash_bits
-
-    for token in tokens:
-        h = int(hashlib.md5(token.encode('utf-8')).hexdigest(), 16)
-        for i in range(hash_bits):
-            if h & (1 << i):
-                vector[i] += 1
-            else:
-                vector[i] -= 1
-
-    fingerprint = 0
-    for i in range(hash_bits):
-        if vector[i] > 0:
-            fingerprint |= (1 << i)
-
-    return fingerprint
-
-
-def hamming_distance(hash1, hash2):
-    """Calculate Hamming distance between two hashes."""
-    x = hash1 ^ hash2
-    distance = 0
-    while x:
-        distance += 1
-        x &= x - 1
-    return distance
-
-
 def apply_deduplication(
     data: List[Dict[str, Any]],
-    method: str = 'minhash',
     threshold: float = 0.8
 ) -> List[Dict[str, Any]]:
     """
-    Apply deduplication to records that passed quality filters (non-destructive).
+    Apply MinHash LSH deduplication to records that passed quality filters (non-destructive).
     Updates filter_passed and filter_reason for duplicates.
 
     Args:
         data: List of records with filter_passed field
-        method: 'exact', 'minhash', or 'simhash'
-        threshold: Similarity threshold (0.0-1.0 for minhash, int for simhash)
+        threshold: Jaccard similarity threshold (0.0-1.0, default 0.8)
 
     Returns:
         Same list with updated fields (no records removed)
     """
-    print(f"Phase 2: Applying {method} deduplication...")
+    print(f"Phase 2: Applying MinHash deduplication (threshold={threshold})...")
 
     duplicates = 0
+    lsh = MinHashLSH(threshold=threshold, num_perm=128)
 
-    if method == 'exact':
-        seen_fingerprints = set()
+    for i, record in enumerate(tqdm(data, desc="MinHash dedup")):
+        if not record['filter_passed']:
+            continue
 
-        for record in tqdm(data, desc="Exact dedup"):
-            if not record['filter_passed']:
-                continue
+        text = get_conversation_text_for_dedup(record)
+        if len(text.strip()) < 10:
+            continue
 
-            fingerprint = get_conversation_fingerprint(record)
-            if fingerprint in seen_fingerprints:
-                record['filter_passed'] = False
-                record['filter_reason'] = 'duplicate_exact'
-                duplicates += 1
-            else:
-                seen_fingerprints.add(fingerprint)
+        minhash = create_minhash(text, num_perm=128)
+        key = f"record_{i}"
+        similar = lsh.query(minhash)
 
-    elif method == 'minhash':
-        lsh = MinHashLSH(threshold=threshold, num_perm=128)
-
-        for i, record in enumerate(tqdm(data, desc="MinHash dedup")):
-            if not record['filter_passed']:
-                continue
-
-            text = get_conversation_text_for_dedup(record)
-            if len(text.strip()) < 10:
-                continue
-
-            minhash = create_minhash(text, num_perm=128)
-            key = f"record_{i}"
-            similar = lsh.query(minhash)
-
-            if similar:
-                record['filter_passed'] = False
-                record['filter_reason'] = 'duplicate_minhash'
-                duplicates += 1
-            else:
-                lsh.insert(key, minhash)
-
-    elif method == 'simhash':
-        simhash_threshold = int(threshold) if threshold > 1 else 3
-        seen_hashes = []
-
-        for record in tqdm(data, desc="SimHash dedup"):
-            if not record['filter_passed']:
-                continue
-
-            text = get_conversation_text_for_dedup(record)
-            if len(text.strip()) < 10:
-                continue
-
-            hash_value = simhash(text, hash_bits=64)
-            is_duplicate = False
-
-            for existing_hash in seen_hashes:
-                distance = hamming_distance(hash_value, existing_hash)
-                if distance <= simhash_threshold:
-                    is_duplicate = True
-                    break
-
-            if is_duplicate:
-                record['filter_passed'] = False
-                record['filter_reason'] = 'duplicate_simhash'
-                duplicates += 1
-            else:
-                seen_hashes.append(hash_value)
-
-    else:
-        raise ValueError(f"Unknown dedup method: {method}")
+        if similar:
+            record['filter_passed'] = False
+            record['filter_reason'] = 'duplicate_minhash'
+            duplicates += 1
+        else:
+            lsh.insert(key, minhash)
 
     passed = sum(1 for r in data if r['filter_passed'])
     print(f"  Duplicates found: {duplicates:,}")
@@ -634,49 +516,10 @@ def apply_embeddings(
 # Clustering Functions
 # =============================================================================
 
-def compute_auto_cluster_params(
-    n_records: int,
-    min_cluster_size: Optional[int] = None,
-    min_samples: Optional[int] = None
-) -> Tuple[int, int]:
-    """
-    Automatically determine HDBSCAN parameters based on dataset size.
-
-    Heuristics:
-    - min_cluster_size: log(n) + 2, clamped to [3, 20]
-    - min_samples: log(n) + 1, clamped to [2, 10]
-
-    Args:
-        n_records: Number of records to cluster
-        min_cluster_size: Override value (None for auto)
-        min_samples: Override value (None for auto)
-
-    Returns:
-        Tuple of (min_cluster_size, min_samples)
-    """
-    log_n = np.log(max(1, n_records))  # Avoid log(0)
-
-    if min_cluster_size is None:
-        # Use log(n) + 2 as default, clamped to [3, 20]
-        auto_min_cluster_size = int(log_n + 2)
-        auto_min_cluster_size = max(3, min(20, auto_min_cluster_size))
-    else:
-        auto_min_cluster_size = min_cluster_size
-
-    if min_samples is None:
-        # Use log(n) + 1 as default, clamped to [2, 10]
-        auto_min_samples = int(log_n + 1)
-        auto_min_samples = max(2, min(10, auto_min_samples))
-    else:
-        auto_min_samples = min_samples
-
-    return auto_min_cluster_size, auto_min_samples
-
-
 def apply_clustering(
     data: List[Dict[str, Any]],
-    min_cluster_size: Optional[int] = None,
-    min_samples: Optional[int] = None,
+    min_cluster_size: int = 2,
+    min_samples: int = 2,
     metric: str = 'euclidean',
     cluster_selection_method: str = 'eom'
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
@@ -685,8 +528,8 @@ def apply_clustering(
 
     Args:
         data: List of records with embedding field
-        min_cluster_size: Minimum cluster size (None for auto)
-        min_samples: Minimum samples (None for auto)
+        min_cluster_size: Minimum cluster size (default: 2)
+        min_samples: Minimum samples (default: 2)
         metric: Distance metric for HDBSCAN
         cluster_selection_method: 'eom' or 'leaf'
 
@@ -694,19 +537,8 @@ def apply_clustering(
         Tuple of (data with cluster fields, clustering stats)
     """
     print("Phase 4: Clustering ALL records...")
-
-    # Track if parameters were auto-computed
-    auto_cluster_size = min_cluster_size is None
-    auto_samples = min_samples is None
-
-    # Auto-determine parameters if not specified
-    min_cluster_size, min_samples = compute_auto_cluster_params(
-        n_records=len(data),
-        min_cluster_size=min_cluster_size,
-        min_samples=min_samples
-    )
-    print(f"  min_cluster_size: {min_cluster_size}{' (auto)' if auto_cluster_size else ''}")
-    print(f"  min_samples: {min_samples}{' (auto)' if auto_samples else ''}")
+    print(f"  min_cluster_size: {min_cluster_size}")
+    print(f"  min_samples: {min_samples}")
 
     # Extract embeddings from records
     embeddings = np.array([record['embedding'] for record in data])
@@ -1127,10 +959,9 @@ def process_wildchat(
     # Embedding/Clustering options
     provider: str = "azure",
     embedding_model: str = None,
-    min_cluster_size: Optional[int] = None,
-    min_samples: Optional[int] = None,
+    min_cluster_size: int = 2,
+    min_samples: int = 2,
     # Filtering options
-    dedup_method: str = "minhash",
     dedup_threshold: float = 0.8,
     # Sampling options
     samples_per_cluster: int = 5,
@@ -1153,7 +984,7 @@ def process_wildchat(
     Phases:
     1. Load data
     2. Quality filtering (adds filter_passed, filter_reason)
-    3. Deduplication (updates filter_passed, filter_reason for duplicates)
+    3. MinHash deduplication (updates filter_passed, filter_reason for duplicates)
     4. Embedding generation (adds embedding to ALL records)
     5. HDBSCAN clustering (adds cluster_id, cluster_probability to ALL records)
     6. Sampling (adds is_sampled)
@@ -1185,7 +1016,7 @@ def process_wildchat(
     print(f"Provider: {provider}")
     print(f"Embedding model: {embedding_model}")
     print(f"Scoring model: {scoring_model}")
-    print(f"Dedup method: {dedup_method}")
+    print(f"Dedup threshold: {dedup_threshold}")
     print("="*60)
 
     # Phase 1: Load data
@@ -1195,8 +1026,8 @@ def process_wildchat(
     # Phase 2: Quality filtering
     data = apply_quality_filters(data)
 
-    # Phase 3: Deduplication
-    data = apply_deduplication(data, dedup_method, dedup_threshold)
+    # Phase 3: MinHash Deduplication
+    data = apply_deduplication(data, dedup_threshold)
 
     # Phase 4: Embedding generation (ALL records)
     data = apply_embeddings(
@@ -1269,7 +1100,7 @@ Examples:
   # Custom parameters
   python process_wildchat.py -i input.parquet -o output.parquet \\
       --provider azure \\
-      --dedup-method minhash \\
+      --dedup-threshold 0.85 \\
       --samples-per-cluster 10 \\
       --parallelism 50
         """
@@ -1286,16 +1117,14 @@ Examples:
                         help='Embedding provider (default: azure)')
     parser.add_argument('--embedding-model', default=None,
                         help='Embedding model name')
-    parser.add_argument('--min-cluster-size', type=int, default=None,
-                        help='HDBSCAN min cluster size (default: auto, log(n)+2 clamped to [3,20])')
-    parser.add_argument('--min-samples', type=int, default=None,
-                        help='HDBSCAN min samples (default: auto, log(n)+1 clamped to [2,10])')
+    parser.add_argument('--min-cluster-size', type=int, default=2,
+                        help='HDBSCAN min cluster size (default: 2)')
+    parser.add_argument('--min-samples', type=int, default=2,
+                        help='HDBSCAN min samples (default: 2)')
 
     # Filtering arguments
-    parser.add_argument('--dedup-method', choices=['exact', 'minhash', 'simhash'],
-                        default='minhash', help='Deduplication method (default: minhash)')
     parser.add_argument('--dedup-threshold', type=float, default=0.8,
-                        help='Deduplication threshold (default: 0.8)')
+                        help='MinHash deduplication threshold (Jaccard similarity 0.0-1.0, default: 0.8)')
 
     # Sampling arguments
     parser.add_argument('--samples-per-cluster', type=int, default=5,
@@ -1336,7 +1165,6 @@ Examples:
         embedding_model=args.embedding_model,
         min_cluster_size=args.min_cluster_size,
         min_samples=args.min_samples,
-        dedup_method=args.dedup_method,
         dedup_threshold=args.dedup_threshold,
         samples_per_cluster=args.samples_per_cluster,
         include_noise=args.include_noise,

@@ -1,0 +1,42 @@
+# Dataset directories
+Wild*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Output files
+*.json
+*.parquet
+*.csv
+
+# Logs
+*.log
+processing_log.txt
+
+# Backup files
+.bak/
+*.bak
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Cleanup script (temporary)
+cleanup.sh
+.vercel
