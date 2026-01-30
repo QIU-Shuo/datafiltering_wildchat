@@ -37,6 +37,11 @@ processing_log.txt
 .DS_Store
 Thumbs.db
 
+# Environment variables
+.env
+.env.local
+.env.*.local
+
 # Cleanup script (temporary)
 cleanup.sh
-.vercel
+.vercel.env
