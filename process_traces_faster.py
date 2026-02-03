@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
 """
-Fast Trace Processing - Quality Filtering and Deduplication Only
+Fast Trace Processing - Quality Filtering, Deduplication, and Diverse Sampling
 
-A lightweight pipeline that applies quality filters and MinHash deduplication
-without clustering or sampling phases.
+A lightweight pipeline that applies quality filters, MinHash deduplication,
+and optionally selects diverse samples using Farthest First Traversal (FFT).
 
 Input: Parquet file with conversation data
-Output: Parquet file with filter_passed and filter_reason columns
+Output: Parquet file with filter_passed, filter_reason, and optionally is_sampled columns
 
 Output Schema (New Columns):
 - filter_passed: bool        - True if passed all quality + dedup checks
 - filter_reason: str | null  - Reason for filtering (null if passed)
+- is_sampled: bool           - True if selected by FFT sampling (only if --sample-n specified)
+
+FFT Sampling:
+  Uses MinHash signatures to compute Jaccard distance between conversations.
+  Iteratively selects the point farthest from all previously selected points,
+  ensuring maximum diversity in the sample set.
 """
 
 import json
@@ -21,6 +27,7 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 from collections import defaultdict
 
+import numpy as np
 from tqdm import tqdm
 from datasets import load_dataset, Dataset
 from datasketch import MinHash, MinHashLSH
@@ -172,49 +179,42 @@ def get_user_input_for_dedup(record):
 # =============================================================================
 
 def is_spam_pattern(text):
-    """Detect common spam patterns."""
+    """Detect common spam patterns while preserving code/technical content."""
     if not text:
         return False
 
     lower_text = text.lower().strip()
 
     # Pattern 1: Excessive repetition of same character
-    if re.search(r'(.)\1{10,}', lower_text):
+    # Only flag truly spammy patterns, not technical content
+    # Skip: whitespace, code separators, error pointers (^), alphanumeric (paths/tokens)
+    for match in re.finditer(r'(.)\1{20,}', lower_text):  # Increased threshold to 20
+        char = match.group(1)
+        # Skip common technical patterns
+        if char.isalnum():  # Skip repeated letters/numbers (API tokens, paths)
+            continue
+        if char in ' \t\n\r-=_#*^~/\\|':  # Skip formatting chars
+            continue
         return True
 
-    # Pattern 2: Excessive repetition of same word
+    # Pattern 2: Excessive repetition of same word (very aggressive threshold)
     words = tokenize_text(lower_text)
-    if len(words) > 10:
+    if len(words) > 20:  # Only check longer texts
         word_counts = {}
         for word in words:
-            if len(word) > 3:
+            if len(word) > 4:  # Only longer words
                 word_counts[word] = word_counts.get(word, 0) + 1
-                if word_counts[word] / len(words) > 0.6:
+                if word_counts[word] / len(words) > 0.7:  # 70% threshold
                     return True
 
-    # Pattern 3: Only special characters or numbers
-    if re.match(r'^[^\w]+$', lower_text, re.UNICODE) and len(lower_text) > 10:
-        return True
-
-    # Pattern 4: Excessive use of same punctuation
-    if re.search(r'[!?.,]{10,}', text):
-        return True
-
-    # Pattern 5: Very long repetitive instructions
-    lines = text.split('\n')
-    if len(text) > 2000 and len(lines) > 20:
-        similar_lines = 0
-        for i in range(len(lines) - 1):
-            for j in range(i + 1, min(i + 10, len(lines))):
-                if lines[i].strip() and len(lines[i]) > 20:
-                    words_i = set(tokenize_text(lines[i]))
-                    words_j = set(tokenize_text(lines[j]))
-                    if len(words_i) > 0 and len(words_j) > 0:
-                        similarity = len(words_i & words_j) / max(len(words_i), len(words_j))
-                        if similarity > 0.7:
-                            similar_lines += 1
-        if similar_lines > len(lines) * 0.3:
+    # Pattern 3: Only special characters (but not code)
+    if re.match(r'^[^\w]+$', lower_text, re.UNICODE) and len(lower_text) > 20:
+        if not re.search(r'[{}\[\]();:,.<>]', text):  # More code chars
             return True
+
+    # Pattern 4: Excessive repeated punctuation (only truly spammy)
+    if re.search(r'[!?]{15,}', text):  # Increased threshold
+        return True
 
     return False
 
@@ -244,8 +244,10 @@ def check_quality(record) -> Tuple[bool, Optional[str]]:
     if not user_text or not user_text.strip():
         return False, "empty_user_input"
 
-    # Check if user input is too short
-    if len(user_text.strip()) < 3:
+    # Check if user input is too short (less than 1 word or less than 5 characters)
+    stripped_text = user_text.strip()
+    word_count = len(tokenize_text(stripped_text))
+    if word_count < 1 or len(stripped_text) < 5:
         return False, "too_short_user_input"
 
     # Check for spam patterns
@@ -390,6 +392,110 @@ def apply_deduplication(
 
 
 # =============================================================================
+# Farthest First Traversal Sampling
+# =============================================================================
+
+def minhash_distance(mh1: MinHash, mh2: MinHash) -> float:
+    """
+    Compute distance between two MinHash signatures.
+    Distance = 1 - Jaccard similarity estimate.
+    """
+    return 1.0 - mh1.jaccard(mh2)
+
+
+def farthest_first_traversal(
+    data: List[Dict[str, Any]],
+    n: int,
+    num_perm: int = 128,
+    seed: int = 42
+) -> List[Dict[str, Any]]:
+    """
+    Sample n records using Farthest First Traversal based on MinHash signatures.
+
+    This method iteratively selects points that are maximally distant from
+    all previously selected points, ensuring diverse coverage of the dataset.
+
+    Args:
+        data: List of records with filter_passed field
+        n: Target number of samples to select
+        num_perm: Number of permutations for MinHash (default 128)
+        seed: Random seed for initial point selection
+
+    Returns:
+        Same list with added 'is_sampled' field
+    """
+    print(f"Phase 3: Farthest First Traversal sampling (target={n})...")
+
+    # Get indices of records that passed all filters
+    passed_indices = [i for i, r in enumerate(data) if r.get('filter_passed', False)]
+
+    if len(passed_indices) == 0:
+        print("  Warning: No records passed filters, skipping sampling")
+        for record in data:
+            record['is_sampled'] = False
+        return data
+
+    print(f"  Records available for sampling: {len(passed_indices):,}")
+
+    # If we want more samples than available, select all
+    if n >= len(passed_indices):
+        print(f"  Target ({n}) >= available ({len(passed_indices)}), selecting all")
+        for i, record in enumerate(data):
+            record['is_sampled'] = record.get('filter_passed', False)
+        return data
+
+    # Generate MinHash signatures for all passed records
+    print("  Generating MinHash signatures...")
+    minhashes = []
+    for idx in tqdm(passed_indices, desc="Computing MinHash"):
+        record = data[idx]
+        text = get_conversation_text_for_dedup(record)
+        mh = create_minhash(text, num_perm=num_perm)
+        minhashes.append(mh)
+
+    # Initialize FFT
+    np.random.seed(seed)
+
+    # Start with a random point
+    first_idx = np.random.randint(0, len(passed_indices))
+    selected_local = [first_idx]  # Indices into passed_indices/minhashes
+
+    # Track minimum distance from each point to the selected set
+    min_distances = np.full(len(passed_indices), np.inf)
+
+    print(f"  Running Farthest First Traversal...")
+    for _ in tqdm(range(n - 1), desc="FFT sampling"):
+        last_selected = selected_local[-1]
+        last_mh = minhashes[last_selected]
+
+        # Update min distances with distance to the newly selected point
+        for i in range(len(passed_indices)):
+            if min_distances[i] > 0:  # Skip already selected (distance = 0)
+                dist = minhash_distance(last_mh, minhashes[i])
+                if dist < min_distances[i]:
+                    min_distances[i] = dist
+
+        # Mark selected point with distance 0 so it won't be picked again
+        min_distances[last_selected] = -1
+
+        # Find the point with maximum minimum distance
+        farthest_idx = np.argmax(min_distances)
+        selected_local.append(farthest_idx)
+
+    # Convert local indices back to global indices
+    selected_global = set(passed_indices[i] for i in selected_local)
+
+    # Mark sampled records
+    for i, record in enumerate(data):
+        record['is_sampled'] = i in selected_global
+
+    sampled_count = sum(1 for r in data if r['is_sampled'])
+    print(f"  Sampled {sampled_count:,} records using FFT")
+
+    return data
+
+
+# =============================================================================
 # I/O Functions
 # =============================================================================
 
@@ -442,6 +548,14 @@ def save_statistics(data: List[Dict[str, Any]], output_file: str):
         'pass_rate': filter_stats['passed'] / len(data) * 100 if data else 0
     }
 
+    # Add sampling statistics if available
+    if any('is_sampled' in r for r in data):
+        sampled_count = sum(1 for r in data if r.get('is_sampled', False))
+        stats['sampling_statistics'] = {
+            'sampled_count': sampled_count,
+            'sample_rate': sampled_count / filter_stats['passed'] * 100 if filter_stats['passed'] > 0 else 0
+        }
+
     with open(stats_file, 'w') as f:
         json.dump(stats, f, indent=2)
 
@@ -455,7 +569,9 @@ def save_statistics(data: List[Dict[str, Any]], output_file: str):
 def process_traces(
     input_file: str,
     output_file: str,
-    dedup_threshold: float = 0.8
+    dedup_threshold: float = 0.8,
+    sample_n: Optional[int] = None,
+    seed: int = 42
 ):
     """
     Run the fast processing pipeline.
@@ -464,13 +580,16 @@ def process_traces(
     1. Load data
     2. Quality filtering (adds filter_passed, filter_reason)
     3. MinHash deduplication (updates filter_passed, filter_reason for duplicates)
-    4. Save complete dataset
+    4. (Optional) FFT sampling (adds is_sampled if sample_n is specified)
+    5. Save complete dataset
     """
     print("=" * 60)
     print("FAST TRACE PROCESSING PIPELINE")
     print("=" * 60)
     print(f"Input: {input_file}")
     print(f"Dedup threshold: {dedup_threshold}")
+    if sample_n is not None:
+        print(f"Sample target: {sample_n}")
     print("=" * 60)
 
     # Phase 1: Load data
@@ -483,7 +602,11 @@ def process_traces(
     # Phase 3: MinHash Deduplication
     data = apply_deduplication(data, dedup_threshold)
 
-    # Phase 4: Save
+    # Phase 4: FFT Sampling (optional)
+    if sample_n is not None:
+        data = farthest_first_traversal(data, n=sample_n, seed=seed)
+
+    # Phase 5: Save
     save_data(data, output_file)
     save_statistics(data, output_file)
 
@@ -495,6 +618,9 @@ def process_traces(
     print(f"Total records: {len(data):,}")
     print(f"Filter passed: {passed:,} ({passed / len(data) * 100:.1f}%)")
     print(f"Filter failed: {len(data) - passed:,} ({(len(data) - passed) / len(data) * 100:.1f}%)")
+    if sample_n is not None:
+        sampled = sum(1 for r in data if r.get('is_sampled', False))
+        print(f"Sampled (FFT): {sampled:,}")
     print(f"Output: {output_file}")
     print("=" * 60)
 
@@ -505,15 +631,22 @@ def process_traces(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description='Fast trace processing: quality filter and deduplicate only',
+        description='Fast trace processing: quality filter, deduplicate, and sample',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Basic usage
+  # Basic usage (filter + dedup only)
   python process_traces_faster.py -i input.parquet -o output.parquet
 
   # Custom deduplication threshold
   python process_traces_faster.py -i input.parquet -o output.parquet --dedup-threshold 0.85
+
+  # With FFT sampling to select exactly 1000 diverse samples
+  python process_traces_faster.py -i input.parquet -o output.parquet --sample-n 1000
+
+  # Full pipeline with custom parameters
+  python process_traces_faster.py -i input.parquet -o output.parquet \\
+      --dedup-threshold 0.85 --sample-n 500 --seed 123
         """
     )
 
@@ -527,10 +660,19 @@ Examples:
     parser.add_argument('--dedup-threshold', type=float, default=0.8,
                         help='MinHash deduplication threshold (Jaccard similarity 0.0-1.0, default: 0.8)')
 
+    # Sampling arguments
+    parser.add_argument('--sample-n', type=int, default=None,
+                        help='Target number of samples to select using Farthest First Traversal. '
+                             'If not specified, no sampling is performed.')
+    parser.add_argument('--seed', type=int, default=42,
+                        help='Random seed for FFT initial point selection (default: 42)')
+
     args = parser.parse_args()
 
     process_traces(
         input_file=args.input,
         output_file=args.output,
-        dedup_threshold=args.dedup_threshold
+        dedup_threshold=args.dedup_threshold,
+        sample_n=args.sample_n,
+        seed=args.seed
     )
